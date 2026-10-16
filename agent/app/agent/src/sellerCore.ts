@@ -50,6 +50,11 @@ import {
 } from "./deliveryPolicy.js";
 import { limitCommerceOperation } from "./requestLimits.js";
 import * as defaultSigning from "./signing.js";
+import {
+  generateEvidenceReport,
+  runVerifications,
+  type VerificationInputs,
+} from "./verification.js";
 
 function safeLogText(value: unknown): string {
   const text =
@@ -406,22 +411,59 @@ export class SellerCore {
     abortSignal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     const spec = await this.signing.jobSpec(jobId);
-    const task =
-      spec !== null
-        ? JSON.stringify({ task: spec.task, terms: spec.terms })
-        : `job ${jobId}`;
-    const prompt =
-      "You accepted and were paid for the following job. Produce the " +
-      "deliverable now. Be complete and self-contained.\n\n" +
-      `JOB CONTEXT:\n${task}`;
-    const work = await this.runWork(prompt, {
-      sessionId: String(jobId),
-      abortSignal,
-    });
+
+    // Parse verification inputs from job spec
+    let inputs: VerificationInputs;
+    if (spec !== null && spec.terms && typeof spec.terms === "object") {
+      const terms = spec.terms as Record<string, unknown>;
+      inputs = {
+        bountyRequirements: String(terms.bountyRequirements ?? ""),
+        githubUrl: String(terms.githubUrl ?? ""),
+        contractAddress: String(terms.contractAddress ?? ""),
+        txHash: String(terms.txHash ?? ""),
+      };
+    } else {
+      // Fallback: extract from task description if terms are missing
+      const task = spec !== null ? spec.task : `job ${jobId}`;
+      inputs = {
+        bountyRequirements: task,
+        githubUrl: "",
+        contractAddress: "",
+        txHash: "",
+      };
+    }
+
+    // Run deterministic verifications
+    const results = await runVerifications(inputs, this.network);
+
+    // Generate deterministic Markdown report
+    let report = generateEvidenceReport(inputs, results);
+
+    // Optionally add LLM explanation (gracefully fail if unavailable)
+    try {
+      const explanationPrompt =
+        "Provide a brief, factual explanation for this verification report based on the structured evidence results below. " +
+        "Do not change any PASS/FAIL/UNVERIFIED statuses. " +
+        "Focus on explaining what the technical checks mean in plain language.\n\n" +
+        JSON.stringify(results, null, 2);
+
+      const explanation = await this.runWork(explanationPrompt, {
+        sessionId: String(jobId),
+        abortSignal,
+      });
+
+      report += "\n\n## AI Explanation — does not affect verification status\n\n";
+      report += explanation;
+    } catch (e) {
+      // LLM unavailable - return deterministic report as-is
+      log.warn(
+        `LLM explanation unavailable for job ${jobId}, returning deterministic report: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
 
     let res: { submitTx: string; deliverableUrl: string | null };
     try {
-      res = await this.signing.submitResult(jobId, work, {
+      res = await this.signing.submitResult(jobId, report, {
         job_id: jobId,
         generator: this.generator,
         built_with: "https://github.com/bnb-chain/bnbagent-studio",
